@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '0.0.0.0';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || ''; // 空ならチェックしない
 const BODY_LIMIT = process.env.BODY_LIMIT || '256mb'; // 既定: 256MB
 const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 4));
-const ADD_FROM_URL_PATH = process.env.ADD_FROM_URL_PATH || '/';
+const ADD_FROM_URL_PATH = process.env.ADD_FROM_URL_PATH || '/api';
 
 const app = express();
 app.disable('x-powered-by');

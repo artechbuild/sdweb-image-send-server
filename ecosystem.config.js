@@ -16,7 +16,7 @@ module.exports = {
         BODY_LIMIT: "256mb",
 
         // === APIエンドポイント ===
-        ADD_FROM_URL_PATH: "/api/item/addFromURL",
+        ADD_FROM_URL_PATH: "/api",
 
         // === 認証 ===
         AUTH_TOKEN: "",
@@ -25,7 +25,7 @@ module.exports = {
         WORKER_CONCURRENCY: 4,
 
         // === 保存先（カンマ区切りで複数指定可能） ===
-        SAVE_ROOTS: "/"
+        SAVE_ROOTS: "/tmp"
       }
     }
   ]
