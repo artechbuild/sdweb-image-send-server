@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 // 保存先は環境変数で柔軟に（カンマ区切りで複数ディレクトリへ複写）
-const SAVE_ROOTS = (process.env.SAVE_ROOTS || '/mnt/Ext9/makesd,/mnt/gd_ilacts_crypt/makesd')
+const SAVE_ROOTS = (process.env.SAVE_ROOTS || '/tmp')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
