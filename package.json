@@ -1,7 +1,7 @@
 {
   "name": "sdweb-image-send-server",
   "version": "1.0.0",
-  "description": "Receiver API for Stable Diffusion WebUI auto image post",
+  "description": "Receiver API for Stable Diffusion WebUI auto image/video post (binary streaming)",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -12,8 +12,7 @@
     "pm2:logs": "pm2 logs image-server"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "fs-extra": "^11.2.0"
+    "express": "^4.19.2"
   },
   "author": "",
   "license": "MIT"
