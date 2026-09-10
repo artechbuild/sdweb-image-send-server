@@ -32,8 +32,12 @@ const MAX_UPLOAD_BYTES = parseSize(process.env.MAX_UPLOAD_BYTES, 2 * 1024 ** 3);
 // 確定フェーズ（最終パスへの rename + 副保存先へのコピー）の同時実行数。
 // 1 = 順次処理。ディスクを取り合わせないため既定は 1。
 const SAVE_CONCURRENCY = Math.max(1, Number(process.env.SAVE_CONCURRENCY || 1));
-// 確定待ちキューの上限。超えたら 503 を返して送信側にリトライさせる。
+// 保存待ちキューの上限。超えたら 503 を返して送信側にリトライさせる。
 const QUEUE_LIMIT = Math.max(1, Number(process.env.QUEUE_LIMIT || 1000));
+// 一部の保存先が失敗したときに再試行する回数と間隔。
+// 超えたら諦めて TMP_PATH のファイルと状態記録を消す（成功した保存先はそのまま残す）。
+const SAVE_MAX_ATTEMPTS = Math.max(1, Number(process.env.SAVE_MAX_ATTEMPTS || 3));
+const SAVE_RETRY_DELAY_MS = Math.max(1000, Number(process.env.SAVE_RETRY_DELAY_MS || 30000));
 
 // 旧 JSON(base64/data URL) 経路。ローリング更新用に受信のみ残す。0 で無効化。
 const ACCEPT_LEGACY_JSON = process.env.ACCEPT_LEGACY_JSON !== '0';
@@ -86,30 +90,31 @@ async function startup() {
         console.error('ERROR: no save root is writable. check ownership/permissions of SAVE_ROOTS.');
     }
 
-    let dir;
+    let tmp, spool;
     try {
-        dir = await storage.ensureTmpDir();
+        tmp = await storage.ensureTmpDir();
     } catch (e) {
         console.error(`ERROR: ${e && e.message}`);
-        console.error('set TMP_PATH to a writable directory (ideally on the same filesystem as the first SAVE_ROOTS entry).');
+        console.error('set TMP_PATH to a writable directory with enough free space.');
         return;
     }
-    console.log(`temp path: ${dir}`);
-
-    // 同一FSなら確定は rename で済む。別FSだとコピーになるので知らせる。
-    const same = await storage.sameDevice(dir, storage.SAVE_ROOTS[0]);
-    if (same === false) {
-        console.log('note: TMP_PATH is on a different filesystem than the first SAVE_ROOTS entry.');
-        console.log('      finalize will copy instead of rename (slower). set TMP_PATH on the same filesystem to avoid it.');
+    try {
+        spool = await storage.ensureSpoolDir();
+    } catch (e) {
+        console.error(`ERROR: ${e && e.message}`);
+        console.error('set SPOOL_DIR to a writable directory.');
+        return;
     }
+    console.log(`temp path (file body):   ${tmp}`);
+    console.log(`spool dir (job state):   ${spool}`);
 
     // /tmp が tmpfs の環境では大きな動画がRAMを消費してしまう
-    if (await storage.isRamBacked(dir)) {
-        console.error(`WARNING: TMP_PATH (${dir}) is a RAM-backed filesystem (tmpfs/ramfs).`);
+    if (await storage.isRamBacked(tmp)) {
+        console.error(`WARNING: TMP_PATH (${tmp}) is a RAM-backed filesystem (tmpfs/ramfs).`);
         console.error('         large uploads would consume memory. set TMP_PATH to a real disk.');
     }
 
-    recoverTmpOnBoot();
+    recoverJobsOnBoot();
 }
 
 server.requestTimeout = REQUEST_TIMEOUT_MS;
@@ -172,17 +177,32 @@ function drainSaveQueue() {
         const job = saveQueue.shift();
         saveRunning++;
         storage.finalize(job)
-            .then(result => {
-                totalDone++;
-                console.log(`saved: ${result.paths[0]} (${job.bytes} bytes, copies=${result.paths.length - 1}, queue=${saveQueue.length})`);
-                for (const f of result.failed) {
-                    console.error(`copy failed: ${f.root} : ${f.error}`);
+            .then(async result => {
+                if (result.complete) {
+                    totalDone++;
+                    console.log(`saved: ${job.rel} (${job.bytes} bytes, roots=${result.paths.length}, queue=${saveQueue.length})`);
+                    return;
                 }
+
+                for (const f of result.failed) {
+                    console.error(`save failed [${job.done.length}/${storage.SAVE_ROOTS.length} done]: ${f.root} : ${f.error}`);
+                }
+
+                if (job.attempts < SAVE_MAX_ATTEMPTS) {
+                    // 未完了の保存先だけを後で再試行する（完了済みはやり直さない）
+                    console.log(`retrying ${job.rel} in ${SAVE_RETRY_DELAY_MS / 1000}s (attempt ${job.attempts}/${SAVE_MAX_ATTEMPTS})`);
+                    setTimeout(() => enqueueFinalize(job), SAVE_RETRY_DELAY_MS).unref();
+                    return;
+                }
+
+                totalFailed++;
+                console.error(`giving up after ${job.attempts} attempts: ${job.rel} (saved to ${job.done.length}/${storage.SAVE_ROOTS.length} roots)`);
+                await storage.abandon(job);
             })
             .catch(e => {
                 totalFailed++;
-                // 一時ファイルは残す（次回起動時の回収対象になる）
-                console.error(`finalize failed: ${job.rel} : ${e && e.message} (temp file kept: ${job.tmpFile})`);
+                // 一時ファイルと状態記録は残す（次回起動時の回収対象になる）
+                console.error(`finalize error: ${job.rel} : ${e && e.message} (temp file kept: ${job.tmpFile})`);
             })
             .finally(() => {
                 saveRunning--;
@@ -191,16 +211,20 @@ function drainSaveQueue() {
     }
 }
 
-async function recoverTmpOnBoot() {
+async function recoverJobsOnBoot() {
     try {
-        const { pending, discarded } = await storage.recoverTmp();
-        if (discarded) console.log(`temp: discarded ${discarded} incomplete leftover(s)`);
+        const { pending, discarded } = await storage.recoverJobs();
+        if (discarded) console.log(`recovery: discarded ${discarded} unusable leftover(s)`);
         if (pending.length) {
-            console.log(`temp: recovering ${pending.length} pending file(s)`);
-            for (const job of pending) enqueueFinalize(job);
+            console.log(`recovery: resuming ${pending.length} unfinished job(s)`);
+            for (const job of pending) {
+                console.log(`  ${job.rel} (${job.done.length}/${storage.SAVE_ROOTS.length} roots already saved)`);
+                job.attempts = 0;   // 起動しなおしたので試行回数をリセット
+                enqueueFinalize(job);
+            }
         }
     } catch (e) {
-        console.error('temp recovery failed:', e && e.message);
+        console.error('recovery failed:', e && e.message);
     }
 }
 
@@ -300,13 +324,13 @@ async function handleBinary(req, res) {
     const rel = path.join(safeFolder, todayStr(), safeName + ext);
 
     try {
-        // --- 受信フェーズ: ボディを一時領域へ直接ストリーム書き込み ---
-        const { tmpFile, metaPath, bytes } = await storage.receiveToTmp(req, { rel, maxBytes: MAX_UPLOAD_BYTES });
+        // --- 受信フェーズ: ボディを TMP_PATH へ直接ストリーム書き込み + 状態記録の作成 ---
+        const job = await storage.receiveToTmp(req, { rel, maxBytes: MAX_UPLOAD_BYTES });
 
-        // --- ここで送信側を解放する。確定はキューに任せて待たせない ---
-        res.status(202).json({ status: 'accepted', bytes, queued: saveQueue.length + 1 });
+        // --- ここで送信側を解放する。保存はキューに任せて待たせない ---
+        res.status(202).json({ status: 'accepted', bytes: job.bytes, queued: saveQueue.length + 1 });
 
-        enqueueFinalize({ tmpFile, metaPath, rel, bytes });
+        enqueueFinalize(job);
     } catch (e) {
         if (e && e.code === 'E_TOO_LARGE') {
             console.error(`rejected (too large): ${rel}`);
@@ -318,9 +342,14 @@ async function handleBinary(req, res) {
             if (!res.headersSent) return reject(res, 400, { status: 'aborted' });
             return;
         }
-        if (e && e.code === 'E_NO_TMP') {
-            console.error(`temp path unavailable: ${rel} : ${e.message}`);
-            if (!res.headersSent) return reject(res, 507, { status: 'temp_unavailable', reason: 'server has no writable temp directory; set TMP_PATH' });
+        if (e && (e.code === 'E_NO_TMP' || e.code === 'E_NO_SPOOL')) {
+            console.error(`storage unavailable: ${rel} : ${e.message}`);
+            if (!res.headersSent) return reject(res, 507, {
+                status: 'storage_unavailable',
+                reason: e.code === 'E_NO_TMP'
+                    ? 'server has no writable temp directory; set TMP_PATH'
+                    : 'server has no writable spool directory; set SPOOL_DIR',
+            });
             return;
         }
         console.error(`receive failed: ${rel} : ${e && e.message}`);
@@ -377,6 +406,7 @@ app.get(ADD_FROM_URL_PATH, (req, res) => {
         legacyJson: ACCEPT_LEGACY_JSON,
         saveRoots: storage.SAVE_ROOTS.length,
         tmpPath: storage.tmpDir(),
+        spoolDir: storage.spoolDir(),
         queue: {
             pending: saveQueue.length,
             running: saveRunning,
