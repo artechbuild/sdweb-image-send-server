@@ -35,7 +35,7 @@ module.exports = {
         // 空なら OS の一時ディレクトリ配下 (<os.tmpdir()>/sdweb-image-send) を使う。
         // SAVE_ROOTS[0] と同じファイルシステム上に置くと、移動が rename だけで済んで速い。
         // 注意: /tmp が tmpfs（RAM）の環境では実ディスク上のパスを明示すること。
-        TMP_PATH: "/tmp",
+        TMP_PATH: "/tmp/sdweb-image-send",
 
         // === バイナリ転送（画像・動画共通の本経路） ===
         // 1ファイルの上限。ストリーム保存なのでメモリではなくディスク保護用の値。
