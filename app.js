@@ -65,11 +65,52 @@ app.use((_req, res, next) => {
 
 const server = app.listen(PORT, HOST, () => {
     console.log(`listening on ${HOST}:${PORT} path=${ADD_FROM_URL_PATH}`);
-    console.log(`save roots: ${storage.SAVE_ROOTS.join(', ')} (primary: ${storage.SAVE_ROOTS[0]})`);
-    console.log(`spool: ${storage.SPOOL_DIR}, save concurrency: ${SAVE_CONCURRENCY}, queue limit: ${QUEUE_LIMIT}`);
     console.log(`max upload: ${(MAX_UPLOAD_BYTES / 1024 ** 2).toFixed(0)} MiB, protocol: ${EFFECTIVE_MIN}-${PROTOCOL_MAX}, legacy json: ${ACCEPT_LEGACY_JSON ? 'on' : 'off'}`);
-    recoverSpoolOnBoot();
+    console.log(`save concurrency: ${SAVE_CONCURRENCY}, queue limit: ${QUEUE_LIMIT}`);
+    startup();
 });
+
+// 起動時に保存先とスプールへ実際に書けるかを確認する。
+// 権限不足をリクエストのたびに EACCES で失敗させるのではなく、起動時に気づけるようにする。
+async function startup() {
+    const roots = await storage.checkSaveRoots();
+    for (const r of roots) {
+        const tag = r.root === storage.SAVE_ROOTS[0] ? 'primary' : 'copy';
+        if (r.ok) {
+            console.log(`save root [${tag}] OK: ${r.root}`);
+        } else {
+            console.error(`save root [${tag}] NOT WRITABLE: ${r.root} : ${r.error}`);
+        }
+    }
+    if (roots.every(r => !r.ok)) {
+        console.error('ERROR: no save root is writable. check ownership/permissions of SAVE_ROOTS.');
+    }
+
+    let dir;
+    try {
+        dir = await storage.ensureTmpDir();
+    } catch (e) {
+        console.error(`ERROR: ${e && e.message}`);
+        console.error('set TMP_PATH to a writable directory (ideally on the same filesystem as the first SAVE_ROOTS entry).');
+        return;
+    }
+    console.log(`temp path: ${dir}`);
+
+    // 同一FSなら確定は rename で済む。別FSだとコピーになるので知らせる。
+    const same = await storage.sameDevice(dir, storage.SAVE_ROOTS[0]);
+    if (same === false) {
+        console.log('note: TMP_PATH is on a different filesystem than the first SAVE_ROOTS entry.');
+        console.log('      finalize will copy instead of rename (slower). set TMP_PATH on the same filesystem to avoid it.');
+    }
+
+    // /tmp が tmpfs の環境では大きな動画がRAMを消費してしまう
+    if (await storage.isRamBacked(dir)) {
+        console.error(`WARNING: TMP_PATH (${dir}) is a RAM-backed filesystem (tmpfs/ramfs).`);
+        console.error('         large uploads would consume memory. set TMP_PATH to a real disk.');
+    }
+
+    recoverTmpOnBoot();
+}
 
 server.requestTimeout = REQUEST_TIMEOUT_MS;
 server.headersTimeout = HEADERS_TIMEOUT_MS;
@@ -140,8 +181,8 @@ function drainSaveQueue() {
             })
             .catch(e => {
                 totalFailed++;
-                // スプールファイルは残す（次回起動時の回収対象になる）
-                console.error(`finalize failed: ${job.rel} : ${e && e.message} (spool kept: ${job.spoolPath})`);
+                // 一時ファイルは残す（次回起動時の回収対象になる）
+                console.error(`finalize failed: ${job.rel} : ${e && e.message} (temp file kept: ${job.tmpFile})`);
             })
             .finally(() => {
                 saveRunning--;
@@ -150,16 +191,16 @@ function drainSaveQueue() {
     }
 }
 
-async function recoverSpoolOnBoot() {
+async function recoverTmpOnBoot() {
     try {
-        const { pending, discarded } = await storage.recoverSpool();
-        if (discarded) console.log(`spool: discarded ${discarded} incomplete leftover(s)`);
+        const { pending, discarded } = await storage.recoverTmp();
+        if (discarded) console.log(`temp: discarded ${discarded} incomplete leftover(s)`);
         if (pending.length) {
-            console.log(`spool: recovering ${pending.length} pending file(s)`);
+            console.log(`temp: recovering ${pending.length} pending file(s)`);
             for (const job of pending) enqueueFinalize(job);
         }
     } catch (e) {
-        console.error('spool recovery failed:', e && e.message);
+        console.error('temp recovery failed:', e && e.message);
     }
 }
 
@@ -249,8 +290,9 @@ async function handleBinary(req, res) {
     }
     if (declared > 0) {
         // スプール + 全保存先の分
+        // 一時領域(1) + 全保存先(N) 分の空きが必要
         const need = declared * (storage.SAVE_ROOTS.length + 1);
-        if (!(await storage.hasFreeSpace(storage.SPOOL_DIR, need))) {
+        if (!(await storage.hasFreeSpace(storage.tmpDir() || storage.SAVE_ROOTS[0], need))) {
             return reject(res, 507, { status: 'insufficient_storage', need });
         }
     }
@@ -258,13 +300,13 @@ async function handleBinary(req, res) {
     const rel = path.join(safeFolder, todayStr(), safeName + ext);
 
     try {
-        // --- 受信フェーズ: ボディをスプールへ直接ストリーム書き込み ---
-        const { spoolPath, metaPath, bytes } = await storage.spoolStream(req, { rel, maxBytes: MAX_UPLOAD_BYTES });
+        // --- 受信フェーズ: ボディを一時領域へ直接ストリーム書き込み ---
+        const { tmpFile, metaPath, bytes } = await storage.receiveToTmp(req, { rel, maxBytes: MAX_UPLOAD_BYTES });
 
         // --- ここで送信側を解放する。確定はキューに任せて待たせない ---
         res.status(202).json({ status: 'accepted', bytes, queued: saveQueue.length + 1 });
 
-        enqueueFinalize({ spoolPath, metaPath, rel, bytes });
+        enqueueFinalize({ tmpFile, metaPath, rel, bytes });
     } catch (e) {
         if (e && e.code === 'E_TOO_LARGE') {
             console.error(`rejected (too large): ${rel}`);
@@ -276,7 +318,12 @@ async function handleBinary(req, res) {
             if (!res.headersSent) return reject(res, 400, { status: 'aborted' });
             return;
         }
-        console.error(`spool failed: ${rel} : ${e && e.message}`);
+        if (e && e.code === 'E_NO_TMP') {
+            console.error(`temp path unavailable: ${rel} : ${e.message}`);
+            if (!res.headersSent) return reject(res, 507, { status: 'temp_unavailable', reason: 'server has no writable temp directory; set TMP_PATH' });
+            return;
+        }
+        console.error(`receive failed: ${rel} : ${e && e.message}`);
         if (!res.headersSent) return reject(res, 500, { status: 'error' });
     }
 }
@@ -329,6 +376,7 @@ app.get(ADD_FROM_URL_PATH, (req, res) => {
         maxUploadBytes: MAX_UPLOAD_BYTES,
         legacyJson: ACCEPT_LEGACY_JSON,
         saveRoots: storage.SAVE_ROOTS.length,
+        tmpPath: storage.tmpDir(),
         queue: {
             pending: saveQueue.length,
             running: saveRunning,
